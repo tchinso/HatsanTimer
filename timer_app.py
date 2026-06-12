@@ -493,6 +493,8 @@ class MciPlayer:
     def __init__(self):
         self.alias = "timerapp_audio"
         self.current_path = ""
+        self.process: Optional[subprocess.Popen] = None
+        self.backend = ""
         self._mci = ctypes.windll.winmm.mciSendStringW
 
     def _send(self, command: str) -> None:
@@ -507,21 +509,111 @@ class MciPlayer:
         self.stop()
         if not path.exists():
             return False, "파일을 찾을 수 없습니다."
+        ok, error = self._play_wpf_loop(path)
+        if ok:
+            return True, ""
+        ok, mci_error = self._play_mci_loop(path)
+        if ok:
+            return True, ""
+        return False, error or mci_error
+
+    def _play_wpf_loop(self, path: Path) -> tuple[bool, str]:
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if not powershell.exists():
+            return False, "PowerShell을 찾을 수 없습니다."
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "Add-Type -AssemblyName PresentationCore; "
+            "$player = New-Object System.Windows.Media.MediaPlayer; "
+            "$player.Open([Uri]::new($env:TIMERAPP_AUDIO_PATH)); "
+            "Start-Sleep -Milliseconds 300; "
+            "$player.Play(); "
+            "$parentPid = 0; "
+            "[int]::TryParse($env:TIMERAPP_PARENT_PID, [ref]$parentPid) | Out-Null; "
+            "try { "
+            "  while ($true) { "
+            "    if ($parentPid -gt 0 -and -not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) { break } "
+            "    Start-Sleep -Milliseconds 200; "
+            "    if ($player.NaturalDuration.HasTimeSpan) { "
+            "      $duration = $player.NaturalDuration.TimeSpan; "
+            "      if ($duration.TotalMilliseconds -gt 0 -and $player.Position.TotalMilliseconds -ge ($duration.TotalMilliseconds - 250)) { "
+            "        $player.Position = [TimeSpan]::Zero; "
+            "        $player.Play(); "
+            "      } "
+            "    } "
+            "  } "
+            "} finally { "
+            "  $player.Stop(); "
+            "  $player.Close(); "
+            "}"
+        )
+        env = os.environ.copy()
+        env["TIMERAPP_AUDIO_PATH"] = str(path)
+        env["TIMERAPP_PARENT_PID"] = str(os.getpid())
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            process = subprocess.Popen(
+                [str(powershell), "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        try:
+            process.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            self.process = process
+            self.current_path = str(path)
+            self.backend = "wpf"
+            return True, ""
+        stderr = ""
+        try:
+            stderr = process.stderr.read() if process.stderr else ""
+        except Exception:
+            stderr = ""
+        return False, stderr.strip() or "WPF MediaPlayer를 초기화하지 못했습니다."
+
+    def _play_mci_loop(self, path: Path) -> tuple[bool, str]:
+        self._close_mci()
         try:
             safe_path = str(path)
             self._send(f'open "{safe_path}" alias {self.alias}')
             self._send(f"play {self.alias} repeat")
             self.current_path = safe_path
+            self.backend = "mci"
             return True, ""
         except Exception as exc:
-            try:
-                self._send(f"close {self.alias}")
-            except Exception:
-                pass
+            self._close_mci()
             self.current_path = ""
+            self.backend = ""
             return False, str(exc)
 
     def stop(self) -> None:
+        if self.process:
+            process = self.process
+            self.process = None
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            try:
+                if process.stderr:
+                    process.stderr.close()
+            except Exception:
+                pass
+        self._close_mci()
+        self.current_path = ""
+        self.backend = ""
+
+    def _close_mci(self) -> None:
         try:
             self._send(f"stop {self.alias}")
         except Exception:
@@ -530,7 +622,6 @@ class MciPlayer:
             self._send(f"close {self.alias}")
         except Exception:
             pass
-        self.current_path = ""
 
 
 def ensure_default_alarm_file() -> Path:
